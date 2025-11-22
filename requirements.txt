@@ -1,4 +1,25 @@
-streamlit
-pandas
-xlsxwriter
-openpyxl
+# Luckin Coffee Advanced Analytics Dashboard - Requirements
+
+# Core dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.17.0
+
+# Date handling
+python-dateutil>=2.8.2
+
+# Data export (optional, for future features)
+openpyxl>=3.1.0  # For Excel export
+xlsxwriter>=3.1.0  # Alternative Excel writer
+
+# Visualization enhancements
+matplotlib>=3.7.0  # For additional chart types
+seaborn>=0.12.0  # For statistical visualizations
+
+# Performance
+pyarrow>=14.0.0  # For faster parquet operations
+
+# Development tools (optional)
+black>=23.0.0  # Code formatting
+pylint>=2.17.0  # Code linting
