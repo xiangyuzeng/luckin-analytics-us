@@ -60,79 +60,64 @@ def clean_currency(x):
             return 0.0
     return float(x) if pd.notnull(x) else 0.0
 
-# --- 数据解析器 (基于提供的 CSV 文件) ---
+# --- 数据解析器 ---
 
 def parse_uber(file):
     try:
-        # Uber CSV 通常元数据在第1行，标题在第2行
+        # Uber CSV based on provided file: Header is on row 1 (index 1)
         df = pd.read_csv(file, header=1)
         
-        # 关键字段映射
-        # 日期: '订单下单时的当地日期'
-        # 销售额: '销售额（含税）'
-        # 状态: '订单状态'
-        # 门店: '餐厅名称'
+        # FIX 1: Update column names based on your actual CSV file
+        # Mapped: '订单下单时的当地日期' -> '订单日期'
+        date_col = '订单日期' if '订单日期' in df.columns else '订单下单时的当地日期'
         
-        df['Date_Str'] = df['订单下单时的当地日期'].astype(str)
+        df['Date_Str'] = df[date_col].astype(str)
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         
         df['Revenue'] = df['销售额（含税）'].apply(clean_currency)
         
         # 状态逻辑
         df['Is_Completed'] = df['订单状态'] == '已完成'
-        df['Is_Cancelled'] = df['订单状态'].isin(['已取消', '退款'])
+        df['Is_Cancelled'] = df['订单状态'].isin(['已取消', '退款', '未完成'])
         
         df['Store'] = df['餐厅名称'].fillna('Unknown Store')
         df['Platform'] = 'Uber Eats'
         
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled']].dropna(subset=['Date'])
     except Exception as e:
-        st.toast(f"Uber 解析错误: {str(e)}", icon="⚠️")
+        st.error(f"Uber 解析错误 (Uber Parse Error): {str(e)}")
         return pd.DataFrame()
 
 def parse_doordash(file):
     try:
         df = pd.read_csv(file)
         
-        # DoorDash 字段映射
-        # 日期: '接单当地时间'
-        # 销售额: '小计'
-        # 状态: '最终订单状态'
-        # 门店: '店铺名称'
-        
         df['Date'] = pd.to_datetime(df['接单当地时间'], errors='coerce')
         df['Revenue'] = df['小计'].apply(clean_currency)
         
         df['Is_Completed'] = df['最终订单状态'] == 'Delivered'
-        df['Is_Cancelled'] = df['最终订单状态'] == 'Cancelled'
+        df['Is_Cancelled'] = df['最终订单状态'].isin(['Cancelled', 'Merchant Cancelled'])
         
         df['Store'] = df['店铺名称'].fillna('Unknown Store')
         df['Platform'] = 'DoorDash'
         
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled']].dropna(subset=['Date'])
     except Exception as e:
-        st.toast(f"DoorDash 解析错误: {str(e)}", icon="⚠️")
+        st.error(f"DoorDash 解析错误 (DoorDash Parse Error): {str(e)}")
         return pd.DataFrame()
 
 def parse_grubhub(file):
     try:
         df = pd.read_csv(file)
         
-        # Grubhub 字段映射
-        # 日期: 'transaction_date' (需要清洗)
-        # 销售额: 'subtotal'
-        # 状态: 'transaction_type'
-        # 门店: 'store_name'
-        
         df = df.dropna(subset=['transaction_date'])
         
-        # 尝试处理 Grubhub 可能出现的日期格式问题
+        # Grubhub dates can be tricky in Excel csvs, coerce handles errors safely
         df['Date'] = pd.to_datetime(df['transaction_date'], errors='coerce')
         df['Revenue'] = df['subtotal'].apply(clean_currency)
         
-        # Grubhub 状态通常隐含在 transaction_type 中
-        # 假设只要有记录且类型不是 Cancel 就算完成
-        df['Is_Cancelled'] = df['transaction_type'].astype(str).str.contains('Cancel', case=False, na=False)
+        # Logic for Grubhub status based on transaction type
+        df['Is_Cancelled'] = df['transaction_type'].astype(str).str.contains('Cancel|Refund', case=False, na=False)
         df['Is_Completed'] = ~df['Is_Cancelled']
         
         df['Store'] = df['store_name'].fillna('Unknown Store')
@@ -140,10 +125,10 @@ def parse_grubhub(file):
         
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled']].dropna(subset=['Date'])
     except Exception as e:
-        st.toast(f"Grubhub 解析错误: {str(e)}", icon="⚠️")
+        st.error(f"Grubhub 解析错误 (Grubhub Parse Error): {str(e)}")
         return pd.DataFrame()
 
-# --- HTML 报告生成器 (完全复刻提供的 HTML) ---
+# --- HTML 报告生成器 ---
 def generate_html_report(df):
     # 1. 计算核心指标
     completed_df = df[df['Is_Completed'] == True].copy()
@@ -165,9 +150,14 @@ def generate_html_report(df):
     # 最高单日销量
     if not completed_df.empty:
         daily_sum = completed_df.groupby(completed_df['Date'].dt.date)['Revenue'].sum()
-        best_day_date = daily_sum.idxmax().strftime('%m月%d日')
-        best_day_val = daily_sum.max()
-        best_day_orders = completed_df[completed_df['Date'].dt.date == daily_sum.idxmax()].shape[0]
+        if not daily_sum.empty:
+            best_day_date = daily_sum.idxmax().strftime('%m月%d日')
+            best_day_val = daily_sum.max()
+            best_day_orders = completed_df[completed_df['Date'].dt.date == daily_sum.idxmax()].shape[0]
+        else:
+            best_day_date = "N/A"
+            best_day_val = 0
+            best_day_orders = 0
     else:
         best_day_date = "N/A"
         best_day_val = 0
@@ -183,9 +173,16 @@ def generate_html_report(df):
     daily_platform = completed_df.groupby([completed_df['Date'].dt.date, 'Platform']).size().unstack(fill_value=0)
     dates_list = [d.strftime('%m/%d') for d in daily_platform.index]
     
-    uber_data = daily_platform.get('Uber Eats', [0]*len(dates_list)).tolist()
-    dd_data = daily_platform.get('DoorDash', [0]*len(dates_list)).tolist()
-    gh_data = daily_platform.get('Grubhub', [0]*len(dates_list)).tolist()
+    # FIX 2: Safe Data Extraction to prevent 'list object has no attribute tolist' error
+    def get_chart_data(platform_name):
+        if platform_name in daily_platform.columns:
+            return daily_platform[platform_name].tolist()
+        else:
+            return [0] * len(dates_list)
+
+    uber_data = get_chart_data('Uber Eats')
+    dd_data = get_chart_data('DoorDash')
+    gh_data = get_chart_data('Grubhub')
     
     # 渠道占比数据
     plat_counts = completed_df['Platform'].value_counts()
@@ -274,7 +271,6 @@ def generate_html_report(df):
         }}
         .logo-area {{ display: flex; align-items: center; gap: 15px; }}
         
-        /* Logo Styling - Image Reference */
         .actual-logo {{
             height: 55px; 
             width: auto; 
@@ -682,7 +678,7 @@ if data_frames:
             )
             
     except Exception as e:
-        st.error(f"处理数据时发生错误: {str(e)}")
+        st.error(f"处理数据时发生错误 (Processing Error): {str(e)}")
 else:
     # 空状态
     st.markdown("""
