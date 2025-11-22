@@ -47,56 +47,55 @@ def clean_currency(x):
     except:
         return 0.0
 
-def find_header_row(df, target_column):
-    """Locates the row index where the actual header exists."""
-    for i, row in df.iterrows():
-        # Check first 50 rows for the target column name
-        if i > 50: break
-        if target_column in row.values:
-            return i + 1 # Return row index relative to original read (header is i)
-    return 0
-
 # --- Data Parsers ---
 
 def parse_uber(file):
     try:
-        # Read first without header to find the structure
-        raw_df = pd.read_csv(file, header=None)
+        # Uber CSVs often have metadata rows. We need to find the header row.
+        # We look for the column "Order Status" or "订单状态"
+        content = file.getvalue().decode('utf-8', errors='replace')
+        lines = content.splitlines()
         
-        # Uber file often has metadata on top. Find row with "订单状态" (Order Status)
-        header_idx = 0
-        for idx, row in raw_df.iterrows():
-            row_str = row.astype(str).values
-            if '订单状态' in row_str or 'Order Status' in row_str:
-                header_idx = idx
+        header_row_index = 0
+        for i, line in enumerate(lines[:50]): # Scan first 50 lines
+            if 'Order Status' in line or '订单状态' in line:
+                header_row_index = i
                 break
         
-        # Re-read with correct header
+        # Reset file pointer and read
         file.seek(0)
-        df = pd.read_csv(file, header=header_idx)
+        df = pd.read_csv(file, header=header_row_index)
 
-        # Column Mapping
+        # Column Mapping (English / Chinese)
         col_map = {
             '订单下单时的当地日期': 'Date_Str',
+            'Request Time': 'Date_Str', 
             '销售额（含税）': 'Revenue_Raw',
+            'Gross Sales': 'Revenue_Raw',
             '订单状态': 'Status',
-            '餐厅名称': 'Store_Name'
+            'Order Status': 'Status',
+            '餐厅名称': 'Store_Name',
+            'Restaurant Name': 'Store_Name'
         }
         df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
         
         if 'Date_Str' not in df.columns:
+            st.error("Uber Error: Could not find Date column.")
             return pd.DataFrame()
 
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         df['Revenue'] = df['Revenue_Raw'].apply(clean_currency)
         
-        # Status Logic: Only "已完成" counts as Completed
-        df['Is_Completed'] = df['Status'] == '已完成'
-        df['Is_Cancelled'] = df['Status'].isin(['已取消', '退款', '未完成'])
+        # Status Logic
+        # 'Completed' or '已完成' counts as a sale
+        df['Is_Completed'] = df['Status'].astype(str).str.contains('Completed|已完成', case=False, na=False)
+        df['Is_Cancelled'] = df['Status'].astype(str).str.contains('Cancelled|Refund|已取消|退款', case=False, na=False)
+        
+        # ID logic: Use Index as ID if no explicit ID column, but usually typically 1 row = 1 order
+        df['Order_ID'] = df.index
         
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'Uber Eats'
-        df['Order_ID'] = df.index # Uber is usually 1 row per order in this export format
         
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled', 'Order_ID']].dropna(subset=['Date'])
     except Exception as e:
@@ -107,12 +106,15 @@ def parse_doordash(file):
     try:
         df = pd.read_csv(file)
         
-        # DoorDash headers are usually at row 0
         col_map = {
             '接单当地时间': 'Date_Str',
+            'Created Time': 'Date_Str',
             '小计': 'Revenue_Raw',
+            'Subtotal': 'Revenue_Raw',
             '最终订单状态': 'Status',
-            '店铺名称': 'Store_Name'
+            'Order Status': 'Status',
+            '店铺名称': 'Store_Name',
+            'Store Name': 'Store_Name'
         }
         df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
         
@@ -128,7 +130,7 @@ def parse_doordash(file):
         
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'DoorDash'
-        df['Order_ID'] = df.index
+        df['Order_ID'] = df.index 
 
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled', 'Order_ID']].dropna(subset=['Date'])
     except Exception as e:
@@ -151,25 +153,39 @@ def parse_grubhub(file):
         if 'Date_Str' not in df.columns:
             return pd.DataFrame()
 
-        # Fix for "########" dates in CSV (Excel export issue)
-        # If we can't parse it, we drop it, but we attempt strictly first
+        # Handle "########" dates from Excel corruption
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         
+        # If Date is missing, try to fallback to time column if it exists
+        if df['Date'].isnull().sum() > len(df) * 0.5: # If more than 50% fail
+             if 'transaction_time_local' in df.columns:
+                 df['Date'] = pd.to_datetime(df['transaction_time_local'], errors='coerce')
+
         df['Revenue'] = df['Revenue_Raw'].apply(clean_currency)
         
-        # Grubhub logic is tricky: Multiple rows per order. 
-        # We only want rows that represent a Sale ("Prepaid Order")
+        # Grubhub Logic: 
+        # 1 Order ID can have multiple rows (Items, Tax, Fees, Adjustments).
+        # We define "Is_Completed" based on positive transaction types.
         
-        # 1. Determine Cancellation/Refund rows
+        df['Type'] = df['Type'].astype(str).fillna('')
+        
+        # Filter out rows that are just fees/taxes for the order count logic, 
+        # but keep them for revenue if they are 'Prepaid Order'
+        
+        # Identify Cancel/Refund Rows
         df['Is_Cancelled_Row'] = df['Type'].str.contains('Cancel|Refund|Adjustment', case=False, na=False)
         
-        # 2. Determine Completed Order Rows (Prepaid Order)
-        df['Is_Completed'] = (df['Type'] == 'Prepaid Order')
-        df['Is_Cancelled'] = df['Is_Cancelled_Row'] # This tracks if a specific row is a cancel action
+        # Identify Base Order Rows (Prepaid Order)
+        df['Is_Order_Row'] = (df['Type'] == 'Prepaid Order') | (df['Type'] == 'Marketplace')
+        
+        # Logic: If it's an Order Row and NOT a cancel row, it's completed
+        df['Is_Completed'] = df['Is_Order_Row'] & ~df['Is_Cancelled_Row']
+        df['Is_Cancelled'] = df['Is_Cancelled_Row']
 
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'Grubhub'
-        df['Order_ID'] = df['Order_ID_Raw']
+        # Treat Order Number as ID. Grubhub has duplicates, we handle this in aggregation.
+        df['Order_ID'] = df['Order_ID_Raw'] 
 
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled', 'Order_ID']].dropna(subset=['Date'])
     except Exception as e:
@@ -179,109 +195,127 @@ def parse_grubhub(file):
 # --- HTML Report Logic ---
 
 def generate_html_report(df):
-    # Ensure date is sorted
+    # Clean and Sort Data
     df = df.sort_values('Date')
     
-    # 1. Prepare Aggregates
+    # --- 1. METRIC CALCULATIONS ---
     
-    # Total GMV (Sum of Revenue for Completed Orders)
-    completed_rows = df[df['Is_Completed'] == True]
+    # FILTER: Only "Completed" lines contribute to GMV
+    completed_lines = df[df['Is_Completed'] == True]
     
-    # Grubhub deduplication for GMV:
-    # Usually Grubhub 'Prepaid Order' rows contain the subtotal. 
-    # We just sum 'Revenue' of Is_Completed rows.
-    total_gmv = completed_rows['Revenue'].sum()
+    # GMV Sum
+    total_gmv = completed_lines['Revenue'].sum()
     
-    # Total Orders (Count Unique Order IDs for Completed Orders)
-    # This fixes the discrepancy where Grubhub had multiple rows
-    total_orders = completed_rows['Order_ID'].nunique()
+    # ORDER COUNT Logic:
+    # Uber/DoorDash: 1 row = 1 order (usually).
+    # Grubhub: Multiple rows per order. We must count UNIQUE Order IDs for completed lines.
+    # We group by Platform to handle the ID uniqueness correctly per platform.
     
-    # Calculate Average Ticket
+    order_count_uber = completed_lines[completed_lines['Platform'] == 'Uber Eats']['Order_ID'].nunique()
+    order_count_dd = completed_lines[completed_lines['Platform'] == 'DoorDash']['Order_ID'].nunique()
+    order_count_gh = completed_lines[completed_lines['Platform'] == 'Grubhub']['Order_ID'].nunique()
+    
+    total_orders = order_count_uber + order_count_dd + order_count_gh
+    
     avg_ticket = total_gmv / total_orders if total_orders > 0 else 0
     
-    # Peak Day Logic
-    daily_sum = completed_rows.groupby(completed_rows['Date'].dt.date)['Revenue'].sum()
-    if not daily_sum.empty:
-        peak_date = daily_sum.idxmax()
-        peak_rev = daily_sum.max()
-        peak_orders = completed_rows[completed_rows['Date'].dt.date == peak_date]['Order_ID'].nunique()
+    # Find Peak Day
+    if not completed_lines.empty:
+        daily_rev = completed_lines.groupby(completed_lines['Date'].dt.date)['Revenue'].sum()
+        peak_date = daily_rev.idxmax()
+        peak_rev = daily_rev.max()
+        # Count orders on that specific day
+        day_mask = completed_lines['Date'].dt.date == peak_date
+        day_df = completed_lines[day_mask]
+        peak_orders = day_df[day_df['Platform'] == 'Uber Eats']['Order_ID'].nunique() + \
+                      day_df[day_df['Platform'] == 'DoorDash']['Order_ID'].nunique() + \
+                      day_df[day_df['Platform'] == 'Grubhub']['Order_ID'].nunique()
+                      
         peak_date_str = peak_date.strftime('%m月%d日')
     else:
         peak_date_str, peak_rev, peak_orders = "N/A", 0, 0
 
     # Cancellation Rate
-    # Count unique IDs associated with Is_Cancelled rows vs Total unique IDs
-    # Note: A simpler metric is just (Count of Cancelled / Total Attempts)
-    # Total attempts = Completed Unique IDs + Cancelled Unique IDs (if separate)
-    # We will approximate: rows marked cancelled / total relevant rows
-    # Better approach for Luckin:
-    all_unique_orders = df['Order_ID'].nunique()
-    # Find Order IDs that have AT LEAST one row marked Cancel/Refund
-    cancelled_order_ids = df[df['Is_Cancelled'] == True]['Order_ID'].unique()
-    cancel_count = len(cancelled_order_ids)
-    cancel_rate = (cancel_count / all_unique_orders * 100) if all_unique_orders > 0 else 0
+    # We define rate as: Unique IDs involved in cancellation / Total Unique IDs found in file
+    all_ids_uber = df[df['Platform'] == 'Uber Eats']['Order_ID'].nunique()
+    all_ids_dd = df[df['Platform'] == 'DoorDash']['Order_ID'].nunique()
+    all_ids_gh = df[df['Platform'] == 'Grubhub']['Order_ID'].nunique()
+    total_unique_ids = all_ids_uber + all_ids_dd + all_ids_gh
     
-    # 2. Prepare Chart Data
+    cancel_lines = df[df['Is_Cancelled'] == True]
+    c_uber = cancel_lines[cancel_lines['Platform'] == 'Uber Eats']['Order_ID'].nunique()
+    c_dd = cancel_lines[cancel_lines['Platform'] == 'DoorDash']['Order_ID'].nunique()
+    c_gh = cancel_lines[cancel_lines['Platform'] == 'Grubhub']['Order_ID'].nunique()
+    total_cancels = c_uber + c_dd + c_gh
     
-    # Trend Chart Data (Line Chart)
-    # X-axis: All dates in range
+    cancel_rate = (total_cancels / total_unique_ids * 100) if total_unique_ids > 0 else 0
+    
+    # --- 2. CHART DATA PREPARATION ---
+    
+    # Trend Chart
     if not df.empty:
-        min_date = df['Date'].min().date()
-        max_date = df['Date'].max().date()
-        all_dates = pd.date_range(min_date, max_date).date
+        min_d = df['Date'].min().date()
+        max_d = df['Date'].max().date()
+        all_dates = pd.date_range(min_d, max_d).date
         dates_js = [d.strftime('%-m/%-d') for d in all_dates]
     else:
         dates_js = []
         all_dates = []
 
-    def get_series(platform_name):
-        plat_df = completed_rows[completed_rows['Platform'] == platform_name]
-        # Group by date and count UNIQUE Order IDs
-        daily_counts = plat_df.groupby(plat_df['Date'].dt.date)['Order_ID'].nunique()
-        # Reindex to ensure all dates are present (0 if missing)
-        return [int(daily_counts.get(d, 0)) for d in all_dates]
+    def get_daily_counts(platform):
+        # Get relevant rows
+        plat_df = completed_lines[completed_lines['Platform'] == platform]
+        # Group by date, count unique IDs
+        daily = plat_df.groupby(plat_df['Date'].dt.date)['Order_ID'].nunique()
+        # Reindex to full date range
+        return [int(daily.get(d, 0)) for d in all_dates]
 
-    uber_data = get_series('Uber Eats')
-    dd_data = get_series('DoorDash')
-    gh_data = get_series('Grubhub')
+    uber_series = get_daily_counts('Uber Eats')
+    dd_series = get_daily_counts('DoorDash')
+    gh_series = get_daily_counts('Grubhub')
     
-    # Pie Chart Data
-    # Count unique orders per platform
-    order_counts = completed_rows.groupby('Platform')['Order_ID'].nunique()
-    val_uber = int(order_counts.get('Uber Eats', 0))
-    val_dd = int(order_counts.get('DoorDash', 0))
-    val_gh = int(order_counts.get('Grubhub', 0))
+    # Store Data
+    # Clean Names
+    completed_lines['Clean_Store'] = completed_lines['Store'].str.replace('Luckin Coffee', '').str.replace('US\d+', '', regex=True).str.replace('-', '').str.strip()
+    completed_lines.loc[completed_lines['Clean_Store'] == '', 'Clean_Store'] = 'Unknown'
     
-    # Store Bar Chart Data
-    # Clean store names
-    completed_rows['Simple_Store'] = completed_rows['Store'].str.replace('Luckin Coffee', '').str.replace('US\d+', '', regex=True).str.strip()
-    completed_rows.loc[completed_rows['Simple_Store'] == '', 'Simple_Store'] = completed_rows['Store'] # Fallback
+    store_perf = completed_lines.groupby('Clean_Store')['Revenue'].sum().sort_values()
+    store_names = store_perf.index.tolist()
+    store_vals = [round(x, 2) for x in store_perf.values]
     
-    store_gmv = completed_rows.groupby('Simple_Store')['Revenue'].sum().sort_values()
-    store_names = store_gmv.index.tolist()
-    store_vals = [round(x, 2) for x in store_gmv.values]
-    top_store_name = store_names[-1] if store_names else "None"
-    top_store_share = (store_vals[-1] / total_gmv * 100) if total_gmv > 0 and store_vals else 0
+    top_store_name = store_names[-1] if store_names else "N/A"
+    top_store_pct = (store_vals[-1] / total_gmv * 100) if total_gmv > 0 and store_vals else 0
 
-    # Table Data Logic
-    share_uber = (completed_rows[completed_rows['Platform']=='Uber Eats']['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
-    share_dd = (completed_rows[completed_rows['Platform']=='DoorDash']['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
-    share_gh = (completed_rows[completed_rows['Platform']=='Grubhub']['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
+    # Pie Chart
+    pie_uber = order_count_uber
+    pie_dd = order_count_dd
+    pie_gh = order_count_gh
+    
+    # Revenue Shares for Table
+    rev_uber = completed_lines[completed_lines['Platform']=='Uber Eats']['Revenue'].sum()
+    rev_dd = completed_lines[completed_lines['Platform']=='DoorDash']['Revenue'].sum()
+    rev_gh = completed_lines[completed_lines['Platform']=='Grubhub']['Revenue'].sum()
+    
+    share_uber = (rev_uber / total_gmv * 100) if total_gmv else 0
+    share_dd = (rev_dd / total_gmv * 100) if total_gmv else 0
+    share_gh = (rev_gh / total_gmv * 100) if total_gmv else 0
 
-    # Dates for Header
-    report_start = min_date.strftime('%Y年%m月%d日') if not df.empty else ""
-    report_end = max_date.strftime('%m月%d日') if not df.empty else ""
+    # Headers
+    report_start = min_d.strftime('%Y年%m月%d日') if not df.empty else ""
+    report_end = max_d.strftime('%m月%d日') if not df.empty else ""
     report_time = datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    # --- HTML Construction ---
-    html_template = f"""
+    # --- 3. HTML GENERATION (FIXED VARIABLE NAME) ---
+    
+    html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Luckin Analytics</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
     <style>
-        /* --- Luckin Coffee Brand Theme --- */
         :root {{
             --luckin-blue: #232773;
             --luckin-light-blue: #88C1F4;
@@ -293,152 +327,38 @@ def generate_html_report(df):
             --warning-orange: #F9AB00;
             --success-green: #34A853;
         }}
-
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        
-        body {{
-            font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
-            background-color: var(--luckin-gray);
-            color: var(--text-main);
-            line-height: 1.5;
-        }}
-
-        /* --- Header Area --- */
-        .header {{
-            background-color: var(--luckin-blue);
-            color: white;
-            padding: 15px 40px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        .logo-area {{
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }}
-        .actual-logo {{
-            height: 55px; 
-            width: auto; 
-            background-color: white; 
-            padding: 2px;
-            border-radius: 6px; 
-            border: 2px solid rgba(255,255,255,0.3);
-        }}
-        
+        body {{ font-family: "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif; background-color: var(--luckin-gray); color: var(--text-main); line-height: 1.5; }}
+        .header {{ background-color: var(--luckin-blue); color: white; padding: 15px 40px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .logo-area {{ display: flex; align-items: center; gap: 15px; }}
+        .actual-logo {{ height: 55px; width: auto; background-color: white; padding: 2px; border-radius: 6px; border: 2px solid rgba(255,255,255,0.3); }}
         .report-title h1 {{ font-size: 24px; font-weight: 600; letter-spacing: 1px; margin: 0; }}
         .report-info {{ text-align: right; font-size: 12px; opacity: 0.9; }}
-
-        /* --- Main Container --- */
-        .container {{
-            max-width: 1400px;
-            margin: 30px auto;
-            padding: 0 20px;
-        }}
-
-        /* --- Cards (KPIs) --- */
-        .kpi-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }}
-        .kpi-card {{
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            border-left: 5px solid var(--luckin-blue);
-            box-shadow: 0 2px 6px rgba(0,0,0,0.05);
-            transition: transform 0.2s;
-        }}
+        .container {{ max-width: 1400px; margin: 30px auto; padding: 0 20px; }}
+        .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .kpi-card {{ background: white; padding: 25px; border-radius: 8px; border-left: 5px solid var(--luckin-blue); box-shadow: 0 2px 6px rgba(0,0,0,0.05); transition: transform 0.2s; }}
         .kpi-card:hover {{ transform: translateY(-2px); }}
         .kpi-label {{ color: var(--text-sub); font-size: 14px; margin-bottom: 8px; }}
         .kpi-value {{ font-size: 28px; font-weight: bold; color: var(--luckin-blue); }}
         .kpi-sub {{ font-size: 12px; color: var(--text-sub); margin-top: 5px; }}
-
-        /* --- Sections --- */
-        .section {{
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            margin-bottom: 25px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.05);
-        }}
-        .section-header {{
-            border-bottom: 1px solid #eee;
-            padding-bottom: 15px;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        .section-title {{
-            font-size: 18px;
-            font-weight: bold;
-            color: var(--luckin-blue);
-        }}
-        
+        .section {{ background: white; padding: 25px; border-radius: 8px; margin-bottom: 25px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }}
+        .section-header {{ border-bottom: 1px solid #eee; padding-bottom: 15px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }}
+        .section-title {{ font-size: 18px; font-weight: bold; color: var(--luckin-blue); }}
         .chart-container {{ width: 100%; height: 400px; min-height: 400px; }}
-        
-        /* --- Tables --- */
-        .styled-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }}
-        .styled-table th {{
-            background-color: #f8f9fa;
-            color: var(--luckin-blue);
-            font-weight: 600;
-            text-align: left;
-            padding: 12px 15px;
-            border-bottom: 2px solid var(--luckin-blue);
-        }}
-        .styled-table td {{
-            padding: 12px 15px;
-            border-bottom: 1px solid #eee;
-        }}
+        .styled-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+        .styled-table th {{ background-color: #f8f9fa; color: var(--luckin-blue); font-weight: 600; text-align: left; padding: 12px 15px; border-bottom: 2px solid var(--luckin-blue); }}
+        .styled-table td {{ padding: 12px 15px; border-bottom: 1px solid #eee; }}
         .styled-table tr:hover {{ background-color: #f1f7ff; }}
-
-        .badge {{
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-        }}
+        .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
         .badge-success {{ background: #e6f4ea; color: var(--success-green); }}
-
-        /* --- Alert Boxes --- */
-        .alert {{
-            padding: 15px;
-            border-radius: 6px;
-            margin-top: 15px;
-            border: 1px solid transparent;
-        }}
-        .alert-danger {{
-            background-color: #fce8e6;
-            border-color: #fad2cf;
-            color: #a50e0e;
-        }}
-        .alert-info {{
-            background-color: #e8f0fe;
-            border-color: #d2e3fc;
-            color: #174ea6;
-        }}
-        
-        .footer {{
-            text-align: center;
-            font-size: 12px;
-            color: #999;
-            margin-top: 40px;
-            padding-bottom: 20px;
-        }}
+        .alert {{ padding: 15px; border-radius: 6px; margin-top: 15px; border: 1px solid transparent; }}
+        .alert-danger {{ background-color: #fce8e6; border-color: #fad2cf; color: #a50e0e; }}
+        .alert-info {{ background-color: #e8f0fe; border-color: #d2e3fc; color: #174ea6; }}
+        .footer {{ text-align: center; font-size: 12px; color: #999; margin-top: 40px; padding-bottom: 20px; }}
     </style>
 </head>
 <body>
 
-    <!-- Header -->
     <header class="header">
         <div class="logo-area">
             <img src="luckin_logo.png" alt="Luckin Logo" class="actual-logo" onerror="this.style.display='none';">
@@ -455,12 +375,11 @@ def generate_html_report(df):
 
     <div class="container">
         
-        <!-- 1. KPI Grid -->
         <div class="kpi-grid">
             <div class="kpi-card">
                 <div class="kpi-label">本月总订单量 (Orders)</div>
                 <div class="kpi-value">{total_orders} <span style="font-size:14px; color:#999;">单</span></div>
-                <div class="kpi-sub">日均: ~{int(total_orders/len(all_dates)) if len(all_dates)>0 else 0} 单</div>
+                <div class="kpi-sub">日均: ~{int(total_orders/len(all_dates)) if len(all_dates) > 0 else 0} 单</div>
             </div>
             <div class="kpi-card">
                 <div class="kpi-label">总营收 (GMV)</div>
@@ -479,7 +398,6 @@ def generate_html_report(df):
             </div>
         </div>
 
-        <!-- 2. Trend Chart -->
         <div class="section">
             <div class="section-header">
                 <div class="section-title">【一、全平台日订单趋势分析】</div>
@@ -487,9 +405,7 @@ def generate_html_report(df):
             <div class="chart-container" id="trendChart"></div>
         </div>
 
-        <!-- 3. Split View -->
         <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-            <!-- Channel Mix -->
             <div class="section" style="flex: 1; min-width: 400px;">
                 <div class="section-header">
                     <div class="section-title">【二、渠道占比 (Market Share)】</div>
@@ -506,36 +422,34 @@ def generate_html_report(df):
                     <tbody>
                         <tr>
                             <td>Uber Eats</td>
-                            <td>{val_uber}</td>
+                            <td>{pie_uber}</td>
                             <td><span class="badge badge-success">{share_uber:.1f}%</span></td>
                         </tr>
                         <tr>
                             <td>DoorDash</td>
-                            <td>{val_dd}</td>
+                            <td>{pie_dd}</td>
                             <td>{share_dd:.1f}%</td>
                         </tr>
                         <tr>
                             <td>Grubhub</td>
-                            <td>{val_gh}</td>
+                            <td>{pie_gh}</td>
                             <td>{share_gh:.1f}%</td>
                         </tr>
                     </tbody>
                 </table>
             </div>
 
-            <!-- Store Performance -->
             <div class="section" style="flex: 1; min-width: 400px;">
                 <div class="section-header">
                     <div class="section-title">【三、门店表现 (Store Performance)】</div>
                 </div>
                 <div class="chart-container" id="storeChart" style="height: 300px; min-height: 300px;"></div>
                 <div class="alert alert-info" style="font-size: 13px;">
-                    <strong>💡 洞察：</strong> {top_store_name} 贡献了超过 {top_store_share:.0f}% 的外卖营收，是目前的核心主力店。
+                    <strong>💡 洞察：</strong> {top_store_name} 贡献了超过 {top_store_pct:.0f}% 的外卖营收，是目前的核心主力店。
                 </div>
             </div>
         </div>
 
-        <!-- 4. Risks -->
         <div class="section">
             <div class="section-header">
                 <div class="section-title" style="color: var(--risk-red);">【四、异常检测与风险预警 (Risk & Anomaly)】</div>
@@ -544,21 +458,19 @@ def generate_html_report(df):
             <div class="alert alert-danger">
                 <h4>⚠️ 1. 退款/取消率分析</h4>
                 <ul style="margin-left: 20px; margin-top: 10px; font-size: 14px;">
-                    <li><strong>涉及订单：</strong> {cancel_count} 笔订单被标记为 "Cancelled" 或 "Refund".</li>
-                    <li><strong>财务影响：</strong> 请检查退款金额对 GMV 的具体损耗。</li>
-                    <li><strong>建议：</strong> 重点检查 {top_store_name} 的接单设备连接状态。</li>
+                    <li><strong>当前取消率：</strong> {cancel_rate:.1f}%</li>
+                    <li><strong>影响：</strong> 共 {total_cancels} 笔订单异常。</li>
+                    <li><strong>建议：</strong> 检查 Broadway 店午高峰接单情况。</li>
                 </ul>
             </div>
-
-            <div class="alert alert-info" style="margin-top: 15px; border-color: #bee5eb; background-color: #e2e6ea; color: #333;">
+             <div class="alert alert-info" style="margin-top: 15px; border-color: #bee5eb; background-color: #e2e6ea; color: #333;">
                 <h4>⚠️ 2. 平台费率波动 (Grubhub)</h4>
                 <p style="font-size: 14px; margin-top: 5px;">
-                    部分 Grubhub 订单出现费率波动，建议核对是否参与了平台出资的促销活动。
+                   检测到 Grubhub 订单费率存在波动，建议核对是否开启了自动推广 (Sponsored Listing)。
                 </p>
             </div>
         </div>
 
-        <!-- 5. Recommendations -->
         <div class="section">
             <div class="section-header">
                 <div class="section-title">【五、下阶段运营建议 (Recommendations)】</div>
@@ -567,16 +479,15 @@ def generate_html_report(df):
                 <div>
                     <h4 style="color: var(--luckin-blue); margin-bottom: 10px;">1. 运营优化 (Operations)</h4>
                     <ul style="padding-left: 20px; font-size: 14px; color: #555;">
-                        <li style="margin-bottom: 8px;">针对 <strong>Uber Eats</strong> (Top Channel) 优化出餐动线，确保骑手取餐等待时间 < 5分钟。</li>
-                        <li style="margin-bottom: 8px;">加强 {top_store_name} 店周末时段的人员配置。</li>
-                        <li>检查库存：防止因缺货导致的被动取消。</li>
+                        <li style="margin-bottom: 8px;">针对 <strong>Uber Eats</strong> 优化出餐动线，确保骑手取餐等待时间 < 5分钟。</li>
+                        <li>加强 {top_store_name} 店周末时段的人员配置。</li>
                     </ul>
                 </div>
                 <div>
                     <h4 style="color: var(--luckin-blue); margin-bottom: 10px;">2. 营销策略 (Marketing)</h4>
                     <ul style="padding-left: 20px; font-size: 14px; color: #555;">
                         <li style="margin-bottom: 8px;"><strong>Grubhub 策略：</strong> 建议推出针对办公人群的 "多人咖啡套餐" (Group Bundle)。</li>
-                        <li style="margin-bottom: 8px;"><strong>DoorDash 策略：</strong> 建议下周开启 "$0 Delivery Fee" 活动以稳定日均单量。</li>
+                        <li><strong>DoorDash 策略：</strong> 建议开启 "$0 Delivery Fee" 活动以稳定日均单量。</li>
                     </ul>
                 </div>
             </div>
@@ -591,12 +502,10 @@ def generate_html_report(df):
     <script>
         document.addEventListener("DOMContentLoaded", function() {{
             
-            // Data Injection
             const dates = {json.dumps(dates_js)};
-            const uberData = {json.dumps(uber_data)};
-            const ddData = {json.dumps(dd_data)};
-            const ghData = {json.dumps(gh_data)};
-            
+            const uberData = {json.dumps(uber_series)};
+            const ddData = {json.dumps(dd_series)};
+            const ghData = {json.dumps(gh_series)};
             const storeNames = {json.dumps(store_names)};
             const storeVals = {json.dumps(store_vals)};
 
@@ -618,7 +527,7 @@ def generate_html_report(df):
                     series: [
                         {{ name: 'Uber Eats', type: 'line', smooth: true, data: uberData, itemStyle: {{ color: '#06C167' }}, lineStyle: {{ width: 3 }} }}, 
                         {{ name: 'DoorDash', type: 'line', smooth: true, data: ddData, itemStyle: {{ color: '#FF3008' }}, lineStyle: {{ width: 3 }} }}, 
-                        {{ name: 'Grubhub', type: 'line', smooth: true, data: ghData, itemStyle: {{ color: '#F6FA00' }}, lineStyle: {{ width: 3, color: '#FF8000' }} }} 
+                        {{ name: 'Grubhub', type: 'line', smooth: true, data: ghData, itemStyle: {{ color: '#FF8000' }}, lineStyle: {{ width: 3, color: '#FF8000' }} }} 
                     ]
                 }});
                 window.addEventListener('resize', function() {{ trendChart.resize(); }});
@@ -637,19 +546,13 @@ def generate_html_report(df):
                             type: 'pie',
                             radius: ['40%', '70%'],
                             avoidLabelOverlap: false,
-                            itemStyle: {{
-                                borderRadius: 10,
-                                borderColor: '#fff',
-                                borderWidth: 2
-                            }},
+                            itemStyle: {{ borderRadius: 10, borderColor: '#fff', borderWidth: 2 }},
                             label: {{ show: false, position: 'center' }},
-                            emphasis: {{
-                                label: {{ show: true, fontSize: 20, fontWeight: 'bold' }}
-                            }},
+                            emphasis: {{ label: {{ show: true, fontSize: 20, fontWeight: 'bold' }} }},
                             data: [
-                                {{ value: {val_uber}, name: 'Uber Eats', itemStyle: {{ color: '#06C167' }} }},
-                                {{ value: {val_dd}, name: 'DoorDash', itemStyle: {{ color: '#FF3008' }} }},
-                                {{ value: {val_gh}, name: 'Grubhub', itemStyle: {{ color: '#FF8000' }} }}
+                                {{ value: {pie_uber}, name: 'Uber Eats', itemStyle: {{ color: '#06C167' }} }},
+                                {{ value: {pie_dd}, name: 'DoorDash', itemStyle: {{ color: '#FF3008' }} }},
+                                {{ value: {pie_gh}, name: 'Grubhub', itemStyle: {{ color: '#FF8000' }} }}
                             ]
                         }}
                     ]
@@ -657,7 +560,7 @@ def generate_html_report(df):
                 window.addEventListener('resize', function() {{ channelChart.resize(); }});
             }}
 
-            // Chart 3: Store Performance (Bar)
+            // Chart 3: Store Performance
             const storeDom = document.getElementById('storeChart');
             if (storeDom) {{
                 const storeChart = echarts.init(storeDom);
@@ -685,9 +588,8 @@ def generate_html_report(df):
     """
     return html
 
-# --- Main Execution ---
+# --- Main App Layout ---
 
-# 1. Navbar
 st.markdown(f"""
     <div class="luckin-navbar">
         <div style="display:flex; align-items:center;">
@@ -707,53 +609,58 @@ with st.sidebar:
     st.title("Control Panel")
     st.markdown("**Step 1: Upload Platform CSVs**")
     
-    uber_file = st.file_uploader("Uber Eats (CSV)", type='csv', key='uber')
-    dd_file = st.file_uploader("DoorDash (CSV)", type='csv', key='dd')
-    gh_file = st.file_uploader("Grubhub (CSV)", type='csv', key='gh')
+    uber_upload = st.file_uploader("Uber Eats (CSV)", type='csv', key='uber')
+    dd_upload = st.file_uploader("DoorDash (CSV)", type='csv', key='dd')
+    gh_upload = st.file_uploader("Grubhub (CSV)", type='csv', key='gh')
     
     st.markdown("---")
-    st.info("ℹ️ The report will auto-update once all files are uploaded.")
+    st.info("ℹ️ Reports auto-update upon file upload.")
 
 # 3. Processing
 data_frames = []
 
-if uber_file:
-    uber_file.seek(0)
-    df_uber = parse_uber(uber_file)
+if uber_upload:
+    uber_upload.seek(0)
+    df_uber = parse_uber(uber_upload)
     if not df_uber.empty: data_frames.append(df_uber)
 
-if dd_file:
-    dd_file.seek(0)
-    df_dd = parse_doordash(dd_file)
+if dd_upload:
+    dd_upload.seek(0)
+    df_dd = parse_doordash(dd_upload)
     if not df_dd.empty: data_frames.append(df_dd)
 
-if gh_file:
-    gh_file.seek(0)
-    df_gh = parse_grubhub(gh_file)
+if gh_upload:
+    gh_upload.seek(0)
+    df_gh = parse_grubhub(gh_upload)
     if not df_gh.empty: data_frames.append(df_gh)
 
-# 4. Display
+# 4. Visualization
 if data_frames:
-    master_df = pd.concat(data_frames, ignore_index=True)
-    html_report = generate_html_report(master_df)
-    
-    st.subheader("📊 Report Preview")
-    # Use a larger height to accommodate the full report length without double scrollbars if possible
-    st.components.v1.html(html_report, height=1400, scrolling=True)
-    
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        st.download_button(
-            label="📥 Download HTML Report",
-            data=html_report,
-            file_name="Luckin_Analytics_Report.html",
-            mime="text/html",
-            type="primary"
-        )
+    try:
+        master_df = pd.concat(data_frames, ignore_index=True)
+        # Generate HTML
+        html_report = generate_html_report(master_df)
+        
+        st.subheader("📊 Report Preview")
+        st.components.v1.html(html_report, height=1400, scrolling=True)
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.download_button(
+                label="📥 Download HTML Report",
+                data=html_report,
+                file_name=f"Luckin_US_Report.html",
+                mime="text/html",
+                type="primary",
+                use_container_width=True
+            )
+            
+    except Exception as e:
+        st.error(f"Processing Error: {str(e)}")
 else:
     st.markdown("""
-        <div style="text-align:center; padding: 50px; color: #666;">
-            <h3>👋 Welcome to Luckin Analytics</h3>
-            <p>Please upload the daily export CSVs from Uber Eats, DoorDash, and Grubhub to generate the consolidated report.</p>
-        </div>
+    <div style='text-align: center; padding: 60px; color: #666;'>
+        <h1>👋 Welcome to Luckin Analytics</h1>
+        <p style="font-size: 18px;">Upload CSV files from the sidebar to generate your report.</p>
+    </div>
     """, unsafe_allow_html=True)
