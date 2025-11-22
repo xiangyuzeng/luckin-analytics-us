@@ -28,6 +28,11 @@ st.markdown("""
             justify-content: space-between;
             margin-bottom: 2rem;
         }
+        .stButton>button {
+            width: 100%;
+            background-color: #232773;
+            color: white;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -35,12 +40,12 @@ st.markdown("""
 
 def clean_currency(x):
     """Cleans currency strings to floats."""
-    if pd.isna(x) or x == '':
+    if pd.isna(x) or str(x).strip() == '':
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
     x = str(x).strip()
-    if '(' in x and ')' in x: x = '-' + x.replace('(', '').replace(')', '') # Handle (5.00) as -5.00
+    if '(' in x and ')' in x: x = '-' + x.replace('(', '').replace(')', '') 
     x = x.replace('$', '').replace(',', '').replace(' ', '')
     try:
         return float(x)
@@ -51,24 +56,23 @@ def clean_currency(x):
 
 def parse_uber(file):
     try:
-        # Uber CSVs often have metadata rows. We need to find the header row.
-        # We look for the column "Order Status" or "订单状态"
         content = file.getvalue().decode('utf-8', errors='replace')
         lines = content.splitlines()
         
+        # Dynamic Header Finder: Look for standard columns
         header_row_index = 0
-        for i, line in enumerate(lines[:50]): # Scan first 50 lines
-            if 'Order Status' in line or '订单状态' in line:
+        for i, line in enumerate(lines[:50]):
+            if '订单状态' in line or 'Order Status' in line:
                 header_row_index = i
                 break
         
-        # Reset file pointer and read
         file.seek(0)
         df = pd.read_csv(file, header=header_row_index)
 
-        # Column Mapping (English / Chinese)
+        # Comprehensive Mapping
         col_map = {
             '订单下单时的当地日期': 'Date_Str',
+            '订单日期': 'Date_Str',           # <--- Added this missing key
             'Request Time': 'Date_Str', 
             '销售额（含税）': 'Revenue_Raw',
             'Gross Sales': 'Revenue_Raw',
@@ -80,22 +84,19 @@ def parse_uber(file):
         df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
         
         if 'Date_Str' not in df.columns:
-            st.error("Uber Error: Could not find Date column.")
+            st.error("Uber Error: Could not find Date column (checked '订单日期', '订单下单时的当地日期').")
             return pd.DataFrame()
 
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         df['Revenue'] = df['Revenue_Raw'].apply(clean_currency)
         
-        # Status Logic
-        # 'Completed' or '已完成' counts as a sale
+        # Uber Logic: 1 Row = 1 Order
         df['Is_Completed'] = df['Status'].astype(str).str.contains('Completed|已完成', case=False, na=False)
         df['Is_Cancelled'] = df['Status'].astype(str).str.contains('Cancelled|Refund|已取消|退款', case=False, na=False)
         
-        # ID logic: Use Index as ID if no explicit ID column, but usually typically 1 row = 1 order
-        df['Order_ID'] = df.index
-        
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'Uber Eats'
+        df['Order_ID'] = df.index # Uber exports typically distinct rows per order
         
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled', 'Order_ID']].dropna(subset=['Date'])
     except Exception as e:
@@ -124,9 +125,8 @@ def parse_doordash(file):
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         df['Revenue'] = df['Revenue_Raw'].apply(clean_currency)
         
-        # Logic
-        df['Is_Completed'] = df['Status'] == 'Delivered'
-        df['Is_Cancelled'] = df['Status'].isin(['Cancelled', 'Merchant Cancelled'])
+        df['Is_Completed'] = df['Status'].isin(['Delivered', '已送达'])
+        df['Is_Cancelled'] = df['Status'].isin(['Cancelled', 'Merchant Cancelled', '已取消'])
         
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'DoorDash'
@@ -153,39 +153,37 @@ def parse_grubhub(file):
         if 'Date_Str' not in df.columns:
             return pd.DataFrame()
 
-        # Handle "########" dates from Excel corruption
         df['Date'] = pd.to_datetime(df['Date_Str'], errors='coerce')
         
-        # If Date is missing, try to fallback to time column if it exists
-        if df['Date'].isnull().sum() > len(df) * 0.5: # If more than 50% fail
-             if 'transaction_time_local' in df.columns:
-                 df['Date'] = pd.to_datetime(df['transaction_time_local'], errors='coerce')
-
+        # Fallback for corrupted excel dates (#######) using index or filename if available
+        # For now, we filter valid dates. 
+        
         df['Revenue'] = df['Revenue_Raw'].apply(clean_currency)
         
-        # Grubhub Logic: 
-        # 1 Order ID can have multiple rows (Items, Tax, Fees, Adjustments).
-        # We define "Is_Completed" based on positive transaction types.
+        # Grubhub Logic:
+        # Multiple rows per order (Items, Tax, Tips, Adjustments).
+        # We must identify 'Order' rows to sum Revenue, but treat Order_ID as the counting unit.
         
         df['Type'] = df['Type'].astype(str).fillna('')
         
-        # Filter out rows that are just fees/taxes for the order count logic, 
-        # but keep them for revenue if they are 'Prepaid Order'
-        
-        # Identify Cancel/Refund Rows
+        # Logic: 'Prepaid Order' is a sale. 'Refund'/'Cancel' are cancellations.
         df['Is_Cancelled_Row'] = df['Type'].str.contains('Cancel|Refund|Adjustment', case=False, na=False)
-        
-        # Identify Base Order Rows (Prepaid Order)
         df['Is_Order_Row'] = (df['Type'] == 'Prepaid Order') | (df['Type'] == 'Marketplace')
         
-        # Logic: If it's an Order Row and NOT a cancel row, it's completed
+        # An order is completed if it has a positive revenue line and isn't just a cancel line
+        # Note: We set Is_Completed on the row level for filtering later
         df['Is_Completed'] = df['Is_Order_Row'] & ~df['Is_Cancelled_Row']
+        
+        # Important: Is_Cancelled marks the specific row. To count total cancelled orders later, 
+        # we check if an Order_ID has ANY Is_Cancelled row.
         df['Is_Cancelled'] = df['Is_Cancelled_Row']
 
         df['Store'] = df['Store_Name'].fillna('Unknown Store')
         df['Platform'] = 'Grubhub'
-        # Treat Order Number as ID. Grubhub has duplicates, we handle this in aggregation.
-        df['Order_ID'] = df['Order_ID_Raw'] 
+        df['Order_ID'] = df['Order_ID_Raw']
+
+        # Filter out purely empty/zero rows unless they are cancellations
+        # df = df[(df['Revenue'] != 0) | (df['Is_Cancelled'])]
 
         return df[['Date', 'Revenue', 'Store', 'Platform', 'Is_Completed', 'Is_Cancelled', 'Order_ID']].dropna(subset=['Date'])
     except Exception as e:
@@ -195,129 +193,110 @@ def parse_grubhub(file):
 # --- HTML Report Logic ---
 
 def generate_html_report(df):
-    # Clean and Sort Data
+    if df.empty:
+        return "<div>No Data Available</div>"
+
     df = df.sort_values('Date')
     
-    # --- 1. METRIC CALCULATIONS ---
+    # 1. Aggregates
+    # Completed Orders Filter
+    completed_df = df[df['Is_Completed'] == True]
     
-    # FILTER: Only "Completed" lines contribute to GMV
-    completed_lines = df[df['Is_Completed'] == True]
+    # GMV: Sum of all completed lines
+    total_gmv = completed_df['Revenue'].sum()
     
-    # GMV Sum
-    total_gmv = completed_lines['Revenue'].sum()
+    # Orders: Count UNIQUE Order IDs per platform then sum
+    # This handles Grubhub's multi-row structure vs Uber's single-row structure
+    u_orders = df[(df['Platform'] == 'Uber Eats') & (df['Is_Completed'])]['Order_ID'].nunique()
+    d_orders = df[(df['Platform'] == 'DoorDash') & (df['Is_Completed'])]['Order_ID'].nunique()
+    g_orders = df[(df['Platform'] == 'Grubhub') & (df['Is_Completed'])]['Order_ID'].nunique()
     
-    # ORDER COUNT Logic:
-    # Uber/DoorDash: 1 row = 1 order (usually).
-    # Grubhub: Multiple rows per order. We must count UNIQUE Order IDs for completed lines.
-    # We group by Platform to handle the ID uniqueness correctly per platform.
-    
-    order_count_uber = completed_lines[completed_lines['Platform'] == 'Uber Eats']['Order_ID'].nunique()
-    order_count_dd = completed_lines[completed_lines['Platform'] == 'DoorDash']['Order_ID'].nunique()
-    order_count_gh = completed_lines[completed_lines['Platform'] == 'Grubhub']['Order_ID'].nunique()
-    
-    total_orders = order_count_uber + order_count_dd + order_count_gh
+    total_orders = u_orders + d_orders + g_orders
     
     avg_ticket = total_gmv / total_orders if total_orders > 0 else 0
     
-    # Find Peak Day
-    if not completed_lines.empty:
-        daily_rev = completed_lines.groupby(completed_lines['Date'].dt.date)['Revenue'].sum()
+    # Peak Day
+    if not completed_df.empty:
+        daily_rev = completed_df.groupby(completed_df['Date'].dt.date)['Revenue'].sum()
         peak_date = daily_rev.idxmax()
         peak_rev = daily_rev.max()
-        # Count orders on that specific day
-        day_mask = completed_lines['Date'].dt.date == peak_date
-        day_df = completed_lines[day_mask]
-        peak_orders = day_df[day_df['Platform'] == 'Uber Eats']['Order_ID'].nunique() + \
-                      day_df[day_df['Platform'] == 'DoorDash']['Order_ID'].nunique() + \
-                      day_df[day_df['Platform'] == 'Grubhub']['Order_ID'].nunique()
-                      
+        
+        # Count unique orders on peak day
+        peak_day_df = df[(df['Date'].dt.date == peak_date) & (df['Is_Completed'])]
+        peak_orders = peak_day_df[peak_day_df['Platform']=='Uber Eats']['Order_ID'].nunique() + \
+                      peak_day_df[peak_day_df['Platform']=='DoorDash']['Order_ID'].nunique() + \
+                      peak_day_df[peak_day_df['Platform']=='Grubhub']['Order_ID'].nunique()
+        
         peak_date_str = peak_date.strftime('%m月%d日')
     else:
         peak_date_str, peak_rev, peak_orders = "N/A", 0, 0
 
     # Cancellation Rate
-    # We define rate as: Unique IDs involved in cancellation / Total Unique IDs found in file
-    all_ids_uber = df[df['Platform'] == 'Uber Eats']['Order_ID'].nunique()
-    all_ids_dd = df[df['Platform'] == 'DoorDash']['Order_ID'].nunique()
-    all_ids_gh = df[df['Platform'] == 'Grubhub']['Order_ID'].nunique()
-    total_unique_ids = all_ids_uber + all_ids_dd + all_ids_gh
+    # (Unique Order IDs with a Cancel flag) / (Total Unique Order IDs)
+    all_unique_ids = df.groupby('Platform')['Order_ID'].nunique().sum()
     
-    cancel_lines = df[df['Is_Cancelled'] == True]
-    c_uber = cancel_lines[cancel_lines['Platform'] == 'Uber Eats']['Order_ID'].nunique()
-    c_dd = cancel_lines[cancel_lines['Platform'] == 'DoorDash']['Order_ID'].nunique()
-    c_gh = cancel_lines[cancel_lines['Platform'] == 'Grubhub']['Order_ID'].nunique()
-    total_cancels = c_uber + c_dd + c_gh
+    # Identify IDs that have at least one cancel row
+    cancel_ids_u = df[(df['Platform']=='Uber Eats') & (df['Is_Cancelled'])]['Order_ID'].unique()
+    cancel_ids_d = df[(df['Platform']=='DoorDash') & (df['Is_Cancelled'])]['Order_ID'].unique()
+    cancel_ids_g = df[(df['Platform']=='Grubhub') & (df['Is_Cancelled'])]['Order_ID'].unique()
     
-    cancel_rate = (total_cancels / total_unique_ids * 100) if total_unique_ids > 0 else 0
-    
-    # --- 2. CHART DATA PREPARATION ---
-    
-    # Trend Chart
-    if not df.empty:
-        min_d = df['Date'].min().date()
-        max_d = df['Date'].max().date()
-        all_dates = pd.date_range(min_d, max_d).date
-        dates_js = [d.strftime('%-m/%-d') for d in all_dates]
-    else:
-        dates_js = []
-        all_dates = []
+    total_cancels = len(cancel_ids_u) + len(cancel_ids_d) + len(cancel_ids_g)
+    cancel_rate = (total_cancels / all_unique_ids * 100) if all_unique_ids > 0 else 0
 
-    def get_daily_counts(platform):
-        # Get relevant rows
-        plat_df = completed_lines[completed_lines['Platform'] == platform]
+    # 2. Chart Data (Strict Alignment)
+    min_date = df['Date'].min().date()
+    max_date = df['Date'].max().date()
+    all_dates = pd.date_range(min_date, max_date).date
+    dates_js = [d.strftime('%-m/%-d') for d in all_dates]
+
+    def get_series_data(plat):
+        # Filter for completed items
+        plat_df = df[(df['Platform'] == plat) & (df['Is_Completed'])]
         # Group by date, count unique IDs
         daily = plat_df.groupby(plat_df['Date'].dt.date)['Order_ID'].nunique()
-        # Reindex to full date range
+        # Reindex
         return [int(daily.get(d, 0)) for d in all_dates]
 
-    uber_series = get_daily_counts('Uber Eats')
-    dd_series = get_daily_counts('DoorDash')
-    gh_series = get_daily_counts('Grubhub')
-    
-    # Store Data
-    # Clean Names
-    completed_lines['Clean_Store'] = completed_lines['Store'].str.replace('Luckin Coffee', '').str.replace('US\d+', '', regex=True).str.replace('-', '').str.strip()
-    completed_lines.loc[completed_lines['Clean_Store'] == '', 'Clean_Store'] = 'Unknown'
-    
-    store_perf = completed_lines.groupby('Clean_Store')['Revenue'].sum().sort_values()
-    store_names = store_perf.index.tolist()
-    store_vals = [round(x, 2) for x in store_perf.values]
-    
-    top_store_name = store_names[-1] if store_names else "N/A"
-    top_store_pct = (store_vals[-1] / total_gmv * 100) if total_gmv > 0 and store_vals else 0
+    uber_data = get_series_data('Uber Eats')
+    dd_data = get_series_data('DoorDash')
+    gh_data = get_series_data('Grubhub')
 
-    # Pie Chart
-    pie_uber = order_count_uber
-    pie_dd = order_count_dd
-    pie_gh = order_count_gh
+    # 3. Store Data
+    # Clean Store Names
+    df['Clean_Store'] = df['Store'].str.replace('Luckin Coffee', '').str.replace('US\d+', '', regex=True).str.replace('-', '').str.strip()
+    df.loc[df['Clean_Store'] == '', 'Clean_Store'] = 'Unknown'
     
-    # Revenue Shares for Table
-    rev_uber = completed_lines[completed_lines['Platform']=='Uber Eats']['Revenue'].sum()
-    rev_dd = completed_lines[completed_lines['Platform']=='DoorDash']['Revenue'].sum()
-    rev_gh = completed_lines[completed_lines['Platform']=='Grubhub']['Revenue'].sum()
+    # Sum Revenue for Completed Orders by Store
+    store_stats = df[df['Is_Completed']].groupby('Clean_Store')['Revenue'].sum().sort_values()
+    store_names = store_stats.index.tolist()
+    store_vals = [round(x, 2) for x in store_stats.values]
     
-    share_uber = (rev_uber / total_gmv * 100) if total_gmv else 0
-    share_dd = (rev_dd / total_gmv * 100) if total_gmv else 0
-    share_gh = (rev_gh / total_gmv * 100) if total_gmv else 0
+    top_store = store_names[-1] if store_names else "N/A"
+    top_val = store_vals[-1] if store_vals else 0
+    top_share = (top_val / total_gmv * 100) if total_gmv > 0 else 0
 
-    # Headers
-    report_start = min_d.strftime('%Y年%m月%d日') if not df.empty else ""
-    report_end = max_d.strftime('%m月%d日') if not df.empty else ""
-    report_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+    # 4. Shares
+    share_u = (df[(df['Platform']=='Uber Eats') & df['Is_Completed']]['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
+    share_d = (df[(df['Platform']=='DoorDash') & df['Is_Completed']]['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
+    share_g = (df[(df['Platform']=='Grubhub') & df['Is_Completed']]['Revenue'].sum() / total_gmv * 100) if total_gmv else 0
 
-    # --- 3. HTML GENERATION (FIXED VARIABLE NAME) ---
-    
+    # Report Header Data
+    r_start = min_date.strftime('%Y年%m月%d日')
+    r_end = max_date.strftime('%m月%d日')
+    r_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    # --- HTML Injection ---
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Luckin Analytics</title>
+    <title>Luckin Operations Report</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
     <style>
         :root {{
-            --luckin-blue: #232773;
+            --luckin-blue: #232773; 
             --luckin-light-blue: #88C1F4;
             --luckin-white: #FFFFFF;
             --luckin-gray: #F2F3F5;
@@ -328,8 +307,21 @@ def generate_html_report(df):
             --success-green: #34A853;
         }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif; background-color: var(--luckin-gray); color: var(--text-main); line-height: 1.5; }}
-        .header {{ background-color: var(--luckin-blue); color: white; padding: 15px 40px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        body {{
+            font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            background-color: var(--luckin-gray);
+            color: var(--text-main);
+            line-height: 1.5;
+        }}
+        .header {{
+            background-color: var(--luckin-blue);
+            color: white;
+            padding: 15px 40px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
         .logo-area {{ display: flex; align-items: center; gap: 15px; }}
         .actual-logo {{ height: 55px; width: auto; background-color: white; padding: 2px; border-radius: 6px; border: 2px solid rgba(255,255,255,0.3); }}
         .report-title h1 {{ font-size: 24px; font-weight: 600; letter-spacing: 1px; margin: 0; }}
@@ -348,7 +340,6 @@ def generate_html_report(df):
         .styled-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
         .styled-table th {{ background-color: #f8f9fa; color: var(--luckin-blue); font-weight: 600; text-align: left; padding: 12px 15px; border-bottom: 2px solid var(--luckin-blue); }}
         .styled-table td {{ padding: 12px 15px; border-bottom: 1px solid #eee; }}
-        .styled-table tr:hover {{ background-color: #f1f7ff; }}
         .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
         .badge-success {{ background: #e6f4ea; color: var(--success-green); }}
         .alert {{ padding: 15px; border-radius: 6px; margin-top: 15px; border: 1px solid transparent; }}
@@ -368,8 +359,8 @@ def generate_html_report(df):
             </div>
         </div>
         <div class="report-info">
-            <div>报告周期: {report_start} - {report_end}</div>
-            <div>生成时间: {report_time}</div>
+            <div>报告周期: {r_start} - {r_end}</div>
+            <div>生成时间: {r_time}</div>
         </div>
     </header>
 
@@ -422,18 +413,18 @@ def generate_html_report(df):
                     <tbody>
                         <tr>
                             <td>Uber Eats</td>
-                            <td>{pie_uber}</td>
-                            <td><span class="badge badge-success">{share_uber:.1f}%</span></td>
+                            <td>{u_orders}</td>
+                            <td><span class="badge badge-success">{share_u:.1f}%</span></td>
                         </tr>
                         <tr>
                             <td>DoorDash</td>
-                            <td>{pie_dd}</td>
-                            <td>{share_dd:.1f}%</td>
+                            <td>{d_orders}</td>
+                            <td>{share_d:.1f}%</td>
                         </tr>
                         <tr>
                             <td>Grubhub</td>
-                            <td>{pie_gh}</td>
-                            <td>{share_gh:.1f}%</td>
+                            <td>{g_orders}</td>
+                            <td>{share_g:.1f}%</td>
                         </tr>
                     </tbody>
                 </table>
@@ -445,7 +436,7 @@ def generate_html_report(df):
                 </div>
                 <div class="chart-container" id="storeChart" style="height: 300px; min-height: 300px;"></div>
                 <div class="alert alert-info" style="font-size: 13px;">
-                    <strong>💡 洞察：</strong> {top_store_name} 贡献了超过 {top_store_pct:.0f}% 的外卖营收，是目前的核心主力店。
+                    <strong>💡 洞察：</strong> {top_store} 贡献了超过 {top_share:.0f}% 的外卖营收，是目前的核心主力店。
                 </div>
             </div>
         </div>
@@ -459,14 +450,15 @@ def generate_html_report(df):
                 <h4>⚠️ 1. 退款/取消率分析</h4>
                 <ul style="margin-left: 20px; margin-top: 10px; font-size: 14px;">
                     <li><strong>当前取消率：</strong> {cancel_rate:.1f}%</li>
-                    <li><strong>影响：</strong> 共 {total_cancels} 笔订单异常。</li>
-                    <li><strong>建议：</strong> 检查 Broadway 店午高峰接单情况。</li>
+                    <li><strong>影响：</strong> 共 {total_cancels} 笔订单涉及异常/取消。</li>
+                    <li><strong>建议：</strong> 检查 {top_store} 店午高峰接单情况。</li>
                 </ul>
             </div>
-             <div class="alert alert-info" style="margin-top: 15px; border-color: #bee5eb; background-color: #e2e6ea; color: #333;">
+
+            <div class="alert alert-info" style="margin-top: 15px; border-color: #bee5eb; background-color: #e2e6ea; color: #333;">
                 <h4>⚠️ 2. 平台费率波动 (Grubhub)</h4>
                 <p style="font-size: 14px; margin-top: 5px;">
-                   检测到 Grubhub 订单费率存在波动，建议核对是否开启了自动推广 (Sponsored Listing)。
+                    建议核对 Grubhub 订单的 "Merchant Service Fee" 是否出现较大波动，确保促销活动配置正确。
                 </p>
             </div>
         </div>
@@ -479,15 +471,15 @@ def generate_html_report(df):
                 <div>
                     <h4 style="color: var(--luckin-blue); margin-bottom: 10px;">1. 运营优化 (Operations)</h4>
                     <ul style="padding-left: 20px; font-size: 14px; color: #555;">
-                        <li style="margin-bottom: 8px;">针对 <strong>Uber Eats</strong> 优化出餐动线，确保骑手取餐等待时间 < 5分钟。</li>
-                        <li>加强 {top_store_name} 店周末时段的人员配置。</li>
+                        <li style="margin-bottom: 8px;">针对 <strong>Uber Eats</strong> (Top Channel) 优化出餐动线，确保骑手取餐等待时间 < 5分钟。</li>
+                        <li style="margin-bottom: 8px;">加强 {top_store} 店周末时段的人员配置。</li>
                     </ul>
                 </div>
                 <div>
                     <h4 style="color: var(--luckin-blue); margin-bottom: 10px;">2. 营销策略 (Marketing)</h4>
                     <ul style="padding-left: 20px; font-size: 14px; color: #555;">
                         <li style="margin-bottom: 8px;"><strong>Grubhub 策略：</strong> 建议推出针对办公人群的 "多人咖啡套餐" (Group Bundle)。</li>
-                        <li><strong>DoorDash 策略：</strong> 建议开启 "$0 Delivery Fee" 活动以稳定日均单量。</li>
+                        <li style="margin-bottom: 8px;"><strong>DoorDash 策略：</strong> 建议开启 "$0 Delivery Fee" 活动以稳定日均单量。</li>
                     </ul>
                 </div>
             </div>
@@ -503,14 +495,19 @@ def generate_html_report(df):
         document.addEventListener("DOMContentLoaded", function() {{
             
             const dates = {json.dumps(dates_js)};
-            const uberData = {json.dumps(uber_series)};
-            const ddData = {json.dumps(dd_series)};
-            const ghData = {json.dumps(gh_series)};
+            const uberData = {json.dumps(uber_data)};
+            const ddData = {json.dumps(dd_data)};
+            const ghData = {json.dumps(gh_data)};
+            
             const storeNames = {json.dumps(store_names)};
             const storeVals = {json.dumps(store_vals)};
+            
+            const valUber = {u_orders};
+            const valDd = {d_orders};
+            const valGh = {g_orders};
 
             if (typeof echarts === 'undefined') {{
-                console.error("ECharts library failed to load.");
+                console.error("ECharts failed to load.");
                 return;
             }}
 
@@ -525,9 +522,9 @@ def generate_html_report(df):
                     xAxis: {{ type: 'category', boundaryGap: false, data: dates }},
                     yAxis: {{ type: 'value', name: '订单量' }},
                     series: [
-                        {{ name: 'Uber Eats', type: 'line', smooth: true, data: uberData, itemStyle: {{ color: '#06C167' }}, lineStyle: {{ width: 3 }} }}, 
-                        {{ name: 'DoorDash', type: 'line', smooth: true, data: ddData, itemStyle: {{ color: '#FF3008' }}, lineStyle: {{ width: 3 }} }}, 
-                        {{ name: 'Grubhub', type: 'line', smooth: true, data: ghData, itemStyle: {{ color: '#FF8000' }}, lineStyle: {{ width: 3, color: '#FF8000' }} }} 
+                        {{ name: 'Uber Eats', type: 'line', smooth: true, data: uberData, itemStyle: {{ color: '#06C167' }}, lineStyle: {{ width: 3 }} }},
+                        {{ name: 'DoorDash', type: 'line', smooth: true, data: ddData, itemStyle: {{ color: '#FF3008' }}, lineStyle: {{ width: 3 }} }},
+                        {{ name: 'Grubhub', type: 'line', smooth: true, data: ghData, itemStyle: {{ color: '#F6FA00' }}, lineStyle: {{ width: 3, color: '#FF8000' }} }}
                     ]
                 }});
                 window.addEventListener('resize', function() {{ trendChart.resize(); }});
@@ -550,9 +547,9 @@ def generate_html_report(df):
                             label: {{ show: false, position: 'center' }},
                             emphasis: {{ label: {{ show: true, fontSize: 20, fontWeight: 'bold' }} }},
                             data: [
-                                {{ value: {pie_uber}, name: 'Uber Eats', itemStyle: {{ color: '#06C167' }} }},
-                                {{ value: {pie_dd}, name: 'DoorDash', itemStyle: {{ color: '#FF3008' }} }},
-                                {{ value: {pie_gh}, name: 'Grubhub', itemStyle: {{ color: '#FF8000' }} }}
+                                {{ value: valUber, name: 'Uber Eats', itemStyle: {{ color: '#06C167' }} }},
+                                {{ value: valDd, name: 'DoorDash', itemStyle: {{ color: '#FF3008' }} }},
+                                {{ value: valGh, name: 'Grubhub', itemStyle: {{ color: '#FF8000' }} }}
                             ]
                         }}
                     ]
